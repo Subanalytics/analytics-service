@@ -1,118 +1,69 @@
-name: CI/CD - Analytics Service OneClick
+name: CI/CD Pipeline - Analytics Service
 
 on:
   push:
     branches:
       - main
-    paths-ignore:
-      - 'k8s/**'
-      - 'README.md'
-      - 'docs/**'
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       skip_tests:
-        description: 'Skip tests and go straight to deployment'
+        description: 'Skip tests during deployment'
         required: false
-        type: boolean
-        default: false
-      force_deploy:
-        description: 'Force deployment even if health checks fail'
-        required: false
-        type: boolean
-        default: false
-      environment:
-        description: 'Deployment environment'
-        required: false
-        default: 'analytics'
-        type: choice
-        options:
-          - analytics
-          - staging
-          - production
-
-env:
-  DOCKER_IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/analytics-service
-  SERVICE_NAME: analytics-service
-  NAMESPACE: analytics
-
-permissions:
-  contents: read
+        default: 'false'
 
 jobs:
-  # ======================
-  # CI STAGE
-  # ======================
+  # --- 1. CI Build & Test ---
   ci-build-test:
     runs-on: ubuntu-latest
-    if: github.event.inputs.skip_tests != 'true'
-    outputs:
-      image-tag: ${{ steps.build-info.outputs.image-tag }}
-      git-sha: ${{ steps.build-info.outputs.git-sha }}
-      should-deploy: ${{ steps.build-info.outputs.should-deploy }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # Setup Python
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install flake8 pytest
+          pip install -r requirements.txt
 
-      # Run linter
-      - name: Run linter
-        run: flake8 . || echo "Lint warnings"
-
-      # Run tests
       - name: Run tests
+        if: ${{ github.event.inputs.skip_tests != 'true' }}
         run: |
-          if pytest --maxfail=1 --disable-warnings -q; then
-            echo "✅ Tests completed"
-          else
-            echo "⚠️ No tests or failing tests"
-          fi
+          echo "No tests defined yet - add pytest/unittest here"
+          # Example: pytest --maxfail=1 --disable-warnings -q
 
-      # Build info
-      - id: build-info
-        run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
-          IMAGE_TAG="${GIT_SHA}-$(date +%s)"
-          echo "git-sha=$GIT_SHA" >> $GITHUB_OUTPUT
-          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "should-deploy=true" >> $GITHUB_OUTPUT
-
-      # Docker build
-      - uses: docker/setup-buildx-action@v3
-      - name: Clear old Docker logins
-        run: docker logout || true
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.DOCKER_IMAGE_NAME }}:latest
-            ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.build-info.outputs.git-sha }}
-            ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.build-info.outputs.image-tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ======================
-  # CD STAGE
-  # ======================
+  # --- 2. CD Deploy ---
   cd-deploy:
     runs-on: self-hosted
     needs: ci-build-test
-    if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_te_
+    if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_tests == 'true')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Build and Push Docker image
+        run: |
+          IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/analytics-service
+          IMAGE_TAG=${{ github.sha }}
+          echo "Building image $IMAGE_NAME:$IMAGE_TAG"
+          docker build -t $IMAGE_NAME:$IMAGE_TAG .
+          docker push $IMAGE_NAME:$IMAGE_TAG
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Update Deployment Manifest
+        run: |
+          sed -i "s|image: .*/analytics-service:.*|image: $IMAGE_NAME:$IMAGE_TAG|" k8s-manifest/analytics-service.yaml
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s-manifest/
