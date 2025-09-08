@@ -1,28 +1,62 @@
-name: CI/CD Pipeline - Analytics Service
+name: CI/CD - Analytics Service OneClick
 
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'k8s/**'
+      - 'README.md'
+      - 'docs/**'
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       skip_tests:
-        description: 'Skip tests during deployment'
+        description: 'Skip tests and go straight to deployment'
         required: false
-        default: 'false'
+        type: boolean
+        default: false
+      force_deploy:
+        description: 'Force deployment even if health checks fail'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'analytics'
+        type: choice
+        options:
+          - analytics
+          - staging
+          - production
 
 env:
   DOCKER_IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/analytics-service
+  SERVICE_NAME: analytics-service
   NAMESPACE: analytics
 
+permissions:
+  contents: read
+
 jobs:
-  ci-build-test-deploy:
+  # ======================
+  # CI STAGE - Build, Test & Docker Push
+  # ======================
+  ci-build-test:
     runs-on: ubuntu-latest
+    if: github.event.inputs.skip_tests != 'true'
+    outputs:
+      image-tag: ${{ steps.build-info.outputs.image-tag }}
+      git-sha: ${{ steps.build-info.outputs.git-sha }}
+      should-deploy: ${{ steps.build-info.outputs.should-deploy }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -33,29 +67,180 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run tests
-        if: ${{ github.event.inputs.skip_tests != 'true' }}
         run: |
-          echo "No tests defined yet - add pytest/unittest here"
+          if [[ "${{ github.event.inputs.skip_tests }}" != 'true' ]]; then
+            echo "No tests defined yet - add pytest/unittest"
+          fi
 
-      # --- Docker Setup ---
+      - name: Set build info
+        id: build-info
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          IMAGE_TAG="${GIT_SHA}-$(date +%s)"
+          echo "git-sha=$GIT_SHA" >> $GITHUB_OUTPUT
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "should-deploy=true" >> $GITHUB_OUTPUT
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      - name: Build and Push Docker image
-        id: docker_build
-        run: |
-          IMAGE_TAG=${{ github.sha }}
-          docker build -t ${{ env.DOCKER_IMAGE_NAME }}:$IMAGE_TAG .
-          docker push ${{ env.DOCKER_IMAGE_NAME }}:$IMAGE_TAG
-          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_NAME }}:latest
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.build-info.outputs.git-sha }}
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.build-info.outputs.image-tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      # --- Update Kubernetes Manifest ---
-      - name: Update Deployment Manifest
+      - name: Container security scan
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          image-ref: ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.build-info.outputs.git-sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload security scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analytics-security-scan
+          path: trivy-results.sarif
+          retention-days: 30
+
+  # ======================
+  # CD STAGE - Deploy to Kubernetes
+  # ======================
+  cd-deploy:
+    runs-on: self-hosted
+    needs: ci-build-test
+    if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_tests == 'true')
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Set deployment variables
         run: |
-          sed -i "s|image: .*/analytics-service:.*|image: ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.docker_build.outputs.image-tag }}|" k8s-manifest/analytics-service.yaml
+          if [[ "${{ github.event.inputs.skip_tests }}" == "true" ]]; then
+            echo "IMAGE_TAG=latest" >> $GITHUB_ENV
+            echo "GIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=${{ steps.build-info.outputs.git-sha }}" >> $GITHUB_ENV
+            echo "GIT_SHA=${{ steps.build-info.outputs.git-sha }}" >> $GITHUB_ENV
+          fi
+          DEPLOY_ENV="${{ github.event.inputs.environment }}"
+          echo "NAMESPACE=${DEPLOY_ENV:-analytics}" >> $GITHUB_ENV
+
+      - name: Setup Namespace
+        run: |
+          if ! kubectl get namespace ${{ env.NAMESPACE }} >/dev/null 2>&1; then
+            kubectl create namespace ${{ env.NAMESPACE }}
+          fi
+
+      - name: Setup RBAC and Security
+        run: |
+          kubectl apply -f - <<EOF || echo "Service account exists"
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: analytics-sa
+            namespace: ${{ env.NAMESPACE }}
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: analytics-role
+            namespace: ${{ env.NAMESPACE }}
+          rules:
+          - apiGroups: [""]
+            resources: ["services","pods","configmaps","secrets"]
+            verbs: ["get","list","watch"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: analytics-rolebinding
+            namespace: ${{ env.NAMESPACE }}
+          subjects:
+          - kind: ServiceAccount
+            name: analytics-sa
+            namespace: ${{ env.NAMESPACE }}
+          roleRef:
+            kind: Role
+            name: analytics-role
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+
+      - name: Deploy Analytics Service
+        run: |
+          IMAGE="${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          if [[ -f "k8s/analytics-deployment.yaml" ]]; then
+            sed "s|image: .*/analytics-service:.*|image: $IMAGE|g" k8s/analytics-deployment.yaml > temp-deployment.yaml
+            kubectl apply -f temp-deployment.yaml -n ${{ env.NAMESPACE }}
+            rm temp-deployment.yaml
+          else
+            kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: analytics-deployment
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: analytics-service
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: analytics-service
+            template:
+              metadata:
+                labels:
+                  app: analytics-service
+              spec:
+                serviceAccountName: analytics-sa
+                containers:
+                - name: analytics
+                  image: $IMAGE
+                  ports:
+                    - containerPort: 8000
+                  env:
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+          EOF
+          fi
+
+      - name: Apply Service
+        run: |
+          if [[ -f "k8s/analytics-service.yaml" ]]; then
+            kubectl apply -f k8s/analytics-service.yaml -n ${{ env.NAMESPACE }}
+          else
+            kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: analytics-service
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: analytics-service
+            ports:
+              - protocol: TCP
+                port: 8000
+                targetPort: 8000
+            type: ClusterIP
+          EOF
+          fi
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/analytics-deployment -n ${{ env.NAMESPACE }} --timeout=300s
