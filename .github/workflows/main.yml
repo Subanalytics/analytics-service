@@ -54,21 +54,34 @@ jobs:
       should-deploy: ${{ steps.build-info.outputs.should-deploy }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      # Setup Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '18'
-          cache: 'npm'
-      - run: npm ci
-      - run: npm run lint || echo "Lint warnings"
-      - run: npm audit --audit-level high || echo "Audit warnings"
-      - run: |
-          if npm run test:coverage 2>/dev/null; then
-            echo "✅ Tests with coverage completed"
-          elif npm test 2>/dev/null; then
+          python-version: '3.12'
+
+      # Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install flake8 pytest
+
+      # Run linter
+      - name: Run linter
+        run: flake8 . || echo "Lint warnings"
+
+      # Run tests
+      - name: Run tests
+        run: |
+          if pytest --maxfail=1 --disable-warnings -q; then
             echo "✅ Tests completed"
           else
-            echo "⚠️ No test script found"
+            echo "⚠️ No tests or failing tests"
           fi
+
+      # Build info
       - id: build-info
         run: |
           GIT_SHA=$(git rev-parse --short HEAD)
@@ -76,6 +89,8 @@ jobs:
           echo "git-sha=$GIT_SHA" >> $GITHUB_OUTPUT
           echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "should-deploy=true" >> $GITHUB_OUTPUT
+
+      # Docker build
       - uses: docker/setup-buildx-action@v3
       - name: Clear old Docker logins
         run: docker logout || true
@@ -100,114 +115,4 @@ jobs:
   cd-deploy:
     runs-on: self-hosted
     needs: ci-build-test
-    if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_tests == 'true')
-
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set deployment variables
-        run: |
-          if [[ "${{ github.event.inputs.skip_tests }}" == "true" ]]; then
-            echo "IMAGE_TAG=latest" >> $GITHUB_ENV
-            echo "GIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          else
-            echo "IMAGE_TAG=${{ needs.ci-build-test.outputs.git-sha }}" >> $GITHUB_ENV
-            echo "GIT_SHA=${{ needs.ci-build-test.outputs.git-sha }}" >> $GITHUB_ENV
-          fi
-          DEPLOY_ENV="${{ github.event.inputs.environment }}"
-          echo "NAMESPACE=${DEPLOY_ENV:-analytics}" >> $GITHUB_ENV
-
-      # ======================
-      # Infra Setup
-      # ======================
-      - name: Setup Namespace and Core Infrastructure
-        run: |
-          if ! kubectl get namespace ${{ env.NAMESPACE }} >/dev/null 2>&1; then
-            kubectl create namespace ${{ env.NAMESPACE }}
-          fi
-
-      # ======================
-      # Deploy Service
-      # ======================
-      - name: Deploy Analytics Service
-        run: |
-          if [[ -f "k8s/analytics-deployment.yaml" ]]; then
-            sed "s|image: tush1809/analytics-service:latest|image: ${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
-              k8s/analytics-deployment.yaml > temp-deployment.yaml
-            kubectl apply -f temp-deployment.yaml -n ${{ env.NAMESPACE }}
-            rm temp-deployment.yaml
-          else
-            kubectl apply -f - <<EOF
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: analytics-deployment
-            namespace: ${{ env.NAMESPACE }}
-            labels:
-              app: analytics-service
-          spec:
-            replicas: 2
-            selector:
-              matchLabels:
-                app: analytics-service
-            template:
-              metadata:
-                labels:
-                  app: analytics-service
-              spec:
-                containers:
-                - name: analytics
-                  image: ${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-                  ports:
-                    - containerPort: 7000
-                  env:
-                    - name: NODE_ENV
-                      value: "production"
-                    - name: PORT
-                      value: "7000"
-          EOF
-          fi
-
-      - name: Apply Service and Networking
-        run: |
-          if [[ -f "k8s/analytics-service.yaml" ]]; then
-            kubectl apply -f k8s/analytics-service.yaml -n ${{ env.NAMESPACE }}
-          else
-            kubectl apply -f - <<EOF
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: analytics-service
-            namespace: ${{ env.NAMESPACE }}
-          spec:
-            selector:
-              app: analytics-service
-            ports:
-              - protocol: TCP
-                port: 7000
-                targetPort: 7000
-            type: ClusterIP
-          EOF
-          fi
-
-      - run: kubectl rollout status deployment/analytics-deployment -n ${{ env.NAMESPACE }} --timeout=300s
-
-  # ======================
-  # Deployment Summary
-  # ======================
-  deployment-summary:
-    runs-on: self-hosted
-    needs: [ci-build-test, cd-deploy]
-    if: always()
-    steps:
-      - run: |
-          echo "=== ANALYTICS SERVICE DEPLOYMENT REPORT ===" > deployment-report.txt
-          echo "Deployment Date: $(date)" >> deployment-report.txt
-          echo "Git SHA: ${{ env.GIT_SHA }}" >> deployment-report.txt
-          echo "Image Tag: ${{ env.IMAGE_TAG }}" >> deployment-report.txt
-          echo "Namespace: ${{ env.NAMESPACE }}" >> deployment-report.txt
-          echo "Service: analytics-service" >> deployment-report.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: analytics-deployment-report
-          path: deployment-report.txt
-          retention-days: 30
+    if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_te_
